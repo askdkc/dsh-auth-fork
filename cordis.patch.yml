@@ -1,11 +1,11 @@
-# @deepseek-harness-tui/dsh-auth bundle patch: mounts provider authentication
+# @askdkc/dsh-auth bundle patch: mounts provider authentication
 # provider routes and the /auth command as a profile layer
-# (`dsh plugin --profile <name> add @deepseek-harness-tui/dsh-auth`).
+# (`dsh plugin --profile <name> add @askdkc/dsh-auth`).
 #
 # Entry-level inject — never a code-level one (see the plugin module's
 # `inject` export): a stale patch must not deadlock a composition whose
 # llm/commands services arrive later or are absent entirely.
 - insert:
     - id: dsh-auth
-      name: '@deepseek-harness-tui/dsh-auth'
+      name: '@askdkc/dsh-auth'
       inject: [llm, commands]

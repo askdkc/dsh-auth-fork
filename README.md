@@ -1,4 +1,6 @@
-# @deepseek-harness-tui/dsh-auth
+# @askdkc/dsh-auth
+
+English | [日本語](README.ja.md)
 
 > Provider authentication for [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) and
 > [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
@@ -32,7 +34,7 @@ provider authentication branch automatically.
 **Standalone, into any dsh profile:**
 
 ```sh
-dsh plugin --profile <name> add @deepseek-harness-tui/dsh-auth
+dsh plugin --profile <name> add @askdkc/dsh-auth
 ```
 
 Then restart the host; `/` lists `auth`, and every model picker gains the
@@ -95,7 +97,7 @@ the `/auth login <provider>` hint — never silently.
 
 ```yaml
 - id: dsh-auth
-  name: '@deepseek-harness-tui/dsh-auth'
+  name: '@askdkc/dsh-auth'
   config:
     providers: [openai-codex, anthropic, xai, opencode, opencode-go, orcarouter, openrouter, nous, infron]
     nous:
