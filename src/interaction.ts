@@ -120,7 +120,6 @@ export class QuestionBridge implements PiAiAuthInteraction {
   }
 
   async prompt(prompt: PiAiAuthPrompt): Promise<string> {
-    const secretNote = prompt.type === 'secret' ? ' (input is not masked on this surface — mind your screen)' : ''
     const question: AskUserQuestionItem = prompt.type === 'select'
       ? {
         id: 'dsh-auth-prompt',
@@ -132,14 +131,15 @@ export class QuestionBridge implements PiAiAuthInteraction {
         })),
       }
       : {
-        id: 'dsh-auth-prompt',
+        id: prompt.type === 'secret' ? 'dsh-auth-secret' : 'dsh-auth-prompt',
         header: 'dsh-auth',
         question: prompt.message,
-        ...(prompt.placeholder === undefined
-          ? (secretNote === '' ? {} : { detail: secretNote.slice(1) })
-          : { detail: `${prompt.placeholder}${secretNote}` }),
+        ...(prompt.placeholder === undefined ? {} : { detail: prompt.placeholder }),
       }
-    const answer = singleAnswer(await this.ask({ questions: [question], signal: prompt.signal ?? this.signal }))
+    const answer = singleAnswer(await this.ask({
+      questions: [question],
+      signal: prompt.signal === undefined ? this.signal : AbortSignal.any([prompt.signal, this.signal]),
+    }))
     if (prompt.type === 'select') {
       const label = answer.selected
       const option = label === undefined ? undefined : prompt.options.find(candidate => candidate.label === label)

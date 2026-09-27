@@ -1,4 +1,4 @@
-# @deepseek-harness-tui/dsh-auth bundle patch: mounts the subscription OAuth
+# @deepseek-harness-tui/dsh-auth bundle patch: mounts provider authentication
 # provider routes and the /auth command as a profile layer
 # (`dsh plugin --profile <name> add @deepseek-harness-tui/dsh-auth`).
 #

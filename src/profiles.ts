@@ -1,10 +1,6 @@
 /**
- * Provider routes this plugin owns: the pi-ai catalog providers that ship an
- * OAuth flow, mounted with their catalog models, wire implementations, and
- * OAuth flow objects untouched. Credential resolution is not wrapped at all —
- * the adapter's collection carries this plugin's `CredentialStore`
- * (`PiAiAuthInjection`), so requests resolve the stored OAuth credential
- * through the provider's own auth and refresh tokens under the store's lock.
+ * Catalog provider routes this plugin owns, mounted with their catalog
+ * models, wire implementations, and authentication methods intact.
  *
  * The hand-built profile mirrors what an empty llm-pi-ai settings profile
  * resolves to for a catalog route, including the image-request defaults
@@ -20,6 +16,17 @@ import { adapterBuiltinProviders, type PiAiProvider } from './pi-ai.js'
 
 /** Provider routes this build mounts, in picker order. */
 export const OAUTH_PROVIDER_IDS = ['openai-codex', 'anthropic', 'xai'] as const
+export const CATALOG_PROVIDER_IDS = [...OAUTH_PROVIDER_IDS, 'opencode', 'opencode-go', 'openrouter'] as const
+export const AUTH_PROVIDER_IDS = [...CATALOG_PROVIDER_IDS, 'orcarouter', 'nous', 'infron'] as const
+export const PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+  hermes: 'nous',
+  'infron.ai': 'infron',
+  'opencode-zen': 'opencode',
+}
+
+export function canonicalProvider(id: string): string {
+  return PROVIDER_ALIASES[id] ?? id
+}
 
 /** One routable provider id. */
 export type OAuthProviderId = (typeof OAUTH_PROVIDER_IDS)[number]
@@ -113,8 +120,8 @@ export function buildOAuthProfile(
   id: string,
   modelOverrides?: Readonly<Record<string, ModelOverride>>,
 ): ResolvedPiAiProviderProfile {
-  if (!(OAUTH_PROVIDER_IDS as readonly string[]).includes(id)) {
-    throw new Error(`dsh-auth: "${id}" is not an OAuth provider this build mounts (${OAUTH_PROVIDER_IDS.join(', ')})`)
+  if (!(CATALOG_PROVIDER_IDS as readonly string[]).includes(id)) {
+    throw new Error(`dsh-auth: "${id}" is not a catalog provider this build mounts (${CATALOG_PROVIDER_IDS.join(', ')})`)
   }
   const catalog = withModelOverrides(catalogProviderOf(id), modelOverrides)
   return {

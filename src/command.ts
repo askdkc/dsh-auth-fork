@@ -13,7 +13,7 @@ const USAGE = 'Usage: /auth [status] | /auth login [provider] | /auth logout <pr
 function renderStatus(rows: readonly DshAuthSignInStatus[]): string {
   const lines = rows.map(row => {
     const state = row.signedIn
-      ? `signed in — token expires ${new Date(row.expiresAt ?? 0).toISOString()}`
+      ? `signed in (${row.credentialKind ?? 'credential'})${row.expiresAt === undefined ? '' : ` — token expires ${new Date(row.expiresAt).toISOString()}`}`
       : row.expired
         ? 'signed in, token expired — /auth login to refresh'
         : 'not signed in'
@@ -23,11 +23,11 @@ function renderStatus(rows: readonly DshAuthSignInStatus[]): string {
 }
 
 /** Split the raw input into at most two lowercase words: verb and target. */
-function parseArgs(raw: string): { verb: string | undefined; target: string | undefined } {
+function parseArgs(raw: string): { verb: string | undefined; target: string | undefined; extra: boolean } {
   const words = raw.trim().split(/\s+/u).filter(word => word !== '')
   const verb = words[0]?.toLowerCase()
   const target = words[1]
-  return { verb: words.length === 0 ? undefined : verb, target }
+  return { verb: words.length === 0 ? undefined : verb, target, extra: words.length > 2 }
 }
 
 /**
@@ -37,7 +37,8 @@ function parseArgs(raw: string): { verb: string | undefined; target: string | un
  */
 export function createAuthCommandHandler(api: DshAuthApi): (invocation: CommandInvocation) => Promise<CommandResult> {
   return async invocation => {
-    const { verb, target } = parseArgs(invocation.rawInput)
+    const { verb, target, extra } = parseArgs(invocation.rawInput)
+    if (extra) return { kind: 'error', text: USAGE }
     if (verb === undefined || verb === 'status') {
       if (target !== undefined) return { kind: 'error', text: USAGE }
       return { kind: 'success', text: renderStatus(await api.providers()) }
@@ -47,8 +48,9 @@ export function createAuthCommandHandler(api: DshAuthApi): (invocation: CommandI
         const result = await api.login(target, invocation.signal)
         return {
           kind: 'success',
-          text: `Signed in to ${result.oauthLabel} (${result.provider}); token expires `
-            + `${new Date(result.expiresAt).toISOString()}. Its models are selectable via /model.`,
+          text: `Signed in to ${result.oauthLabel} (${result.provider}) with ${result.credentialKind}`
+            + `${result.expiresAt === undefined ? '' : `; token expires ${new Date(result.expiresAt).toISOString()}`}.`
+            + `${result.modelWarning === undefined ? ' Select a model via /model.' : ` Credential saved, but models are unavailable: ${result.modelWarning}`}`,
         }
       } catch (error: unknown) {
         return { kind: 'error', text: `dsh-auth: ${error instanceof Error ? error.message : String(error)}` }

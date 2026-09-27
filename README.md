@@ -1,22 +1,22 @@
 # @deepseek-harness-tui/dsh-auth
 
-> Subscription OAuth sign-in for [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) and
+> Provider authentication for [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) and
 > [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
-Use your **ChatGPT (Plus/Pro)**, **Claude (Pro/Max)** and **SuperGrok / X Premium**
-subscriptions as model providers — sign in with the official account, no API
-keys, and **no dsh source patch**. This plugin is developed alongside (and
+Use **ChatGPT, Claude, SuperGrok, OpenCode Zen/Go, OrcaRouter, OpenRouter,
+Nous Portal, and Infron** as model providers with OAuth, device code, or an
+API key according to the provider. No dsh source patch is needed. This plugin is developed alongside (and
 bundled into) [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI), the
 Claude Code style terminal front door for DeepSeek Harness; it also installs
 standalone into any dsh profile.
 
 ```
-dsh-tui → /provider → 订阅账号登录（OAuth）→ sign in   ← the TUI integration
+dsh-tui → /provider → Provider authentication → sign in
           /auth login openai-codex                     ← the plugin command
           /model → OpenAI Codex → gpt-5.6-sol          ← routes & models
 ```
 
-**Status: experimental (M1).** The OAuth flows themselves are
+**Status: experimental.** Catalog OAuth flows are
 [pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai)'s shipped
 implementations (device-code and loopback callback included); this plugin
 adds the hosting: credential storage, automatic token refresh, adapter
@@ -27,7 +27,7 @@ the TUI, the web client, and refuses cleanly on headless hosts.
 
 **With dsh-TUI** — nothing to do: dsh-auth ships inside the dsh-tui package
 (bundled dependency). Update dsh-tui and the `/provider` wizard gains its
-subscription sign-in branch automatically.
+provider authentication branch automatically.
 
 **Standalone, into any dsh profile:**
 
@@ -40,15 +40,16 @@ signed-in providers' catalogs (credential-gated — see below).
 
 ## What it does
 
-- Mounts the pi-ai catalog providers that ship OAuth flows as `llm` registry
-  routes: `openai-codex`, `anthropic`, `xai`. **Models appear in a picker
+- Mounts pi-ai catalog providers as `llm` registry routes:
+  `openai-codex`, `anthropic`, `xai`, `opencode`, `opencode-go`, and `openrouter`.
+  **Models appear in a picker
   only after that provider is signed in** (credential-gated listing) — sign
   in and the catalog appears, sign out and it disappears; model ids already
   saved in sessions stay resolvable either way.
 - Loads those Provider objects from the exact pi-ai dependency owned by the
   installed `dsh-llm-pi-ai`. rc and alpha hosts therefore keep their supported
   pi-ai versions without passing Provider objects across package instances.
-- `/auth login [provider]` runs the provider's OAuth flow interactively. The
+- `/auth login [provider]` runs the selected authentication method interactively. The
   waiting panel behaves the way pi's host does: the authorization URL is
   **opened in your browser automatically** (never hand-copied — the URL is
   hundreds of characters and wrap artifacts corrupt its `redirect_uri`),
@@ -57,6 +58,12 @@ signed-in providers' catalogs (credential-gated — see below).
   the short code the copy target. OpenAI Codex also offers a device-code
   login method — the most robust path on headless or locked-down machines
   (no localhost:1455 callback needed).
+- OpenCode Zen/Go accept API keys. OpenRouter offers pi-ai's OAuth PKCE flow
+  or a manual API key. `orcarouter`, `nous`, and `infron` use Chat Completions;
+  their `/models` listings must provide capacity and pricing metadata before
+  a model is selectable. `nous` offers device-code OAuth and an explicitly
+  selected manual Bearer token compatibility path. The latter has not been
+  validated against a real Nous account.
 - Stored access tokens refresh automatically before each request, serialized
   per provider under the credential store's lock — concurrent requests never
   double-refresh a rotated token.
@@ -72,6 +79,12 @@ signed-in providers' catalogs (credential-gated — see below).
 /auth login openai-codex       # ChatGPT (Plus/Pro)
 /auth login anthropic          # Claude (Pro/Max)
 /auth login xai                # SuperGrok / X Premium
+/auth login opencode           # OpenCode Zen API key
+/auth login opencode-go        # OpenCode Go API key
+/auth login orcarouter         # OrcaRouter API key
+/auth login openrouter         # OAuth PKCE or API key
+/auth login nous               # device code or manual Bearer
+/auth login infron             # Infron API key
 /auth logout anthropic
 ```
 
@@ -84,7 +97,9 @@ the `/auth login <provider>` hint — never silently.
 - id: dsh-auth
   name: '@deepseek-harness-tui/dsh-auth'
   config:
-    providers: [openai-codex, anthropic, xai]   # any non-empty subset
+    providers: [openai-codex, anthropic, xai, opencode, opencode-go, orcarouter, openrouter, nous, infron]
+    nous:
+      clientId: hermes-cli
     # credentialsFile: /secure/path/credentials.json
 ```
 
@@ -93,6 +108,10 @@ the `/auth login <provider>` hint — never silently.
   `DSH_AUTH_CREDENTIALS` environment variable. The directory is created
   `0700`, the file `0600` (best-effort on Windows), and every write is
   atomic (temp file + rename).
+- Aliases `opencode-zen`, `hermes`, and `infron.ai` resolve to `opencode`,
+  `nous`, and `infron`. Credentials are stored under canonical IDs.
+- The Nous client ID defaults to `hermes-cli`; third-party reuse of this ID is
+  not guaranteed by Nous. Set `nous.clientId` if your deployment has its own.
 - A route another adapter family already owns — an `llm-pi-ai` settings
   profile naming the same provider — is refused by the registry; the plugin
   logs the refusal and mounts the remaining routes. Keep one provider on one
@@ -100,18 +119,17 @@ the `/auth login <provider>` hint — never silently.
 
 ## Security notes
 
-- The credential file holds **long-lived refresh tokens**. It is never
+- The credential file holds **API keys and long-lived refresh tokens**. It is never
   logged, never echoed through status surfaces (`/auth status` shows expiry
   metadata only), and a corrupt file fails loudly instead of being
   overwritten.
-- Secret prompts warn that terminal input is not masked on this surface.
+- dsh-TUI masks API-key input and redacts it from questionnaire summaries.
 - Login refuses to run where no interactive surface is registered (no
   browser/GUI assumptions — remote and headless hosts get a clear error,
   per the ecosystem spec's remote-determinism rule, TUI-RUN-001).
 - Subscription authentication and API-key access are different products:
-  this plugin uses each provider's subscription backend only (ChatGPT Codex
-  backend for OpenAI, Claude Pro/Max for Anthropic) and does not turn a
-  subscription into a general-purpose API credential.
+  ChatGPT Codex and Claude Pro/Max use their subscription backends; the new
+  API-key routes use each service's API backend.
 
 ## Development
 
@@ -134,7 +152,7 @@ the [dsh-TUI repository](https://github.com/ccch1mneyyy/dsh-TUI) as the
   group.
 - **M3** — `dsh-ecosystem-spec` conformance (manifest validation, admission
   fixtures) plus the remaining pi-ai OAuth providers (GitHub Copilot,
-  OpenRouter, Kimi); community list entry.
+  Kimi); community list entry.
 - **M4** — Gemini: a custom Google device-code flow (pi-ai ships none; this
   is the one wheel this project plans to build itself).
 

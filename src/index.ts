@@ -1,13 +1,12 @@
 /**
- * dsh-auth — subscription OAuth sign-in as LLM provider routes.
+ * dsh-auth — provider sign-in as LLM provider routes.
  *
- * One cordis plugin mounts the pi-ai catalog providers that ship OAuth flows
- * (ChatGPT/Codex, Claude Pro/Max, SuperGrok) as `llm` registry routes, so
- * their models appear in every model picker the moment the plugin loads —
- * signing in is the only missing credential. `PiAiAdapter` runs with this
+ * One cordis plugin mounts pi-ai catalog and custom provider profiles as
+ * `llm` registry routes, so
+ * catalog models appear in every model picker after sign-in. `PiAiAdapter` runs with this
  * plugin's file-backed pi-ai `CredentialStore` injected
- * (`PiAiAuthInjection`): requests resolve the stored OAuth credential through
- * the provider's own auth and rotate refresh tokens under the store's lock.
+ * (`PiAiAuthInjection`): requests resolve stored credentials through the
+ * provider's own auth or an explicit API key. Refreshes hold the store lock.
  * Login/logout run over the `userQuestions` seam, so they work on any
  * interactive surface and refuse cleanly where none exists (TUI-RUN-001).
  *
@@ -15,7 +14,7 @@
  * - id: dsh-auth
  *   name: 'dsh-auth'
  *   config:
- *     providers: [openai-codex, anthropic, xai]   # subset of the mounted set
+ *     providers: [openai-codex, anthropic, xai]   # explicit subset; omitted mounts all supported routes
  *     # credentialsFile: /secure/path/credentials.json   # default $DSH_HOME/dsh-auth/
  *     # Per-provider catalog overrides, keyed by provider id then model id:
  *     # any optional field keeps the installed catalog's value. The example
@@ -44,7 +43,9 @@ import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { PiAiAdapterOptions } from '@deepseek-ai/dsh-llm-pi-ai'
 import { CredentialFile, defaultCredentialsFile } from './credentials.js'
-import { buildOAuthProfile, OAUTH_PROVIDER_IDS, type ModelOverride } from './profiles.js'
+import { buildOAuthProfile, AUTH_PROVIDER_IDS, CATALOG_PROVIDER_IDS, OAUTH_PROVIDER_IDS, canonicalProvider, type ModelOverride } from './profiles.js'
+import { createCustomProfile, CUSTOM_PROVIDER_IDS, type CustomProviderId } from './custom-profiles.js'
+import { refreshNous } from './nous-oauth.js'
 import type { AskFn } from './interaction.js'
 import { createDshAuthApi, DshAuthService } from './service.js'
 import { createAuthCommandHandler } from './command.js'
@@ -78,7 +79,7 @@ interface CommandsLike {
 
 /** Plugin configuration. */
 export interface Config {
-  /** Provider routes to mount; every entry must ship an OAuth flow in the installed pi-ai catalog. */
+  /** Provider routes to mount; omitted mounts all supported routes. */
   providers?: string[]
   /** Credential file override; default `$DSH_HOME/dsh-auth/credentials.json`. */
   credentialsFile?: string
@@ -89,6 +90,7 @@ export interface Config {
    * ship — is refused, never skipped, so a typo lands as a boot error.
    */
   modelOverrides?: Record<string, Record<string, ModelOverride>>
+  nous?: { clientId?: string }
 }
 
 const modelOverride = z.object({
@@ -97,9 +99,10 @@ const modelOverride = z.object({
 })
 
 export const Config: z<Config> = z.object({
-  providers: z.array(z.string()).default([...OAUTH_PROVIDER_IDS]),
+  providers: z.array(z.string()).default([...AUTH_PROVIDER_IDS]),
   credentialsFile: z.string(),
   modelOverrides: z.dict(z.dict(modelOverride)),
+  nous: z.object({ clientId: z.string() }),
 })
 
 export type { DshAuthApi, DshAuthLoginResult, DshAuthSignInStatus, DshAuthService } from './service.js'
@@ -108,7 +111,7 @@ export { QuestionBridge, describeEvent } from './interaction.js'
 export type { AskFn, QuestionBridgeHelpers } from './interaction.js'
 export { copyToClipboard, openInBrowser, openerFor } from './opener.js'
 export { CredentialFile, defaultCredentialsFile } from './credentials.js'
-export { OAUTH_PROVIDER_IDS, buildOAuthProfile, type ModelOverride } from './profiles.js'
+export { OAUTH_PROVIDER_IDS, CATALOG_PROVIDER_IDS, AUTH_PROVIDER_IDS, canonicalProvider, buildOAuthProfile, type ModelOverride } from './profiles.js'
 
 /**
  * The ambient auth context providers may consult while resolving their own
@@ -128,7 +131,7 @@ function hostAuthContext(): PiAiAuthContext {
 
 /**
  * The adapter the plugin registers: a {@link PiAiAdapter} whose *advisory
- * catalog* is credential-gated. A provider with no stored OAuth credential
+ * catalog* is credential-gated. A provider with no stored credential
  * lists no models — its rows never reach any model picker, which is the
  * whole point: picking a model that would only fail with "not signed in"
  * is noise. The gate only shapes `listModels`; `resolveModel` and requests
@@ -156,11 +159,11 @@ export class CredentialGatedAdapter extends PiAiAdapter {
 
 /** Mount the routes, the service, and the command. */
 export function apply(ctx: Context, config: Config): void {
-  const configured = config.providers ?? [...OAUTH_PROVIDER_IDS]
-  const unknown = configured.filter(id => !(OAUTH_PROVIDER_IDS as readonly string[]).includes(id))
+  const configured = (config.providers ?? [...AUTH_PROVIDER_IDS]).map(canonicalProvider)
+  const unknown = configured.filter(id => !(AUTH_PROVIDER_IDS as readonly string[]).includes(id))
   if (unknown.length > 0 || configured.length === 0) {
     throw new Error(
-      `dsh-auth: providers must be a non-empty subset of [${OAUTH_PROVIDER_IDS.join(', ')}]; got [${configured.join(', ')}]`,
+      `dsh-auth: providers must be a non-empty subset of [${AUTH_PROVIDER_IDS.join(', ')}]; got [${configured.join(', ')}]`,
     )
   }
   // Overrides are provider-scoped: a provider key outside the mounted set is
@@ -176,8 +179,26 @@ export function apply(ctx: Context, config: Config): void {
   // Profile construction validates the installed catalog loudly: a pi-ai
   // downgrade that dropped a provider fails the boot that asked for it, and
   // a per-model miss is refused per route (see buildOAuthProfile).
-  const profiles = new Map(configured.map(id => [id, buildOAuthProfile(id, overrides[id])]))
+  const custom = new Map(CUSTOM_PROVIDER_IDS.filter(id => configured.includes(id))
+    .map(id => [id, createCustomProfile(id, overrides[id])] as const))
+  const profiles = new Map(configured.map(id => [id,
+    custom.get(id as CustomProviderId)?.profile ?? buildOAuthProfile(id, overrides[id]),
+  ] as const))
   const store = new CredentialFile(config.credentialsFile ?? defaultCredentialsFile())
+
+  const credentialKey = async (provider: string): Promise<string | undefined> => {
+    const current = await store.read(provider)
+    if (current?.type === 'api_key') return current.key
+    if (provider !== 'nous' || current?.type !== 'oauth') return undefined
+    if (current.expires > Date.now() + 60_000) return current.access
+    const refreshed = await store.modify('nous', async latest => {
+      if (latest?.type !== 'oauth') return undefined
+      if (latest.expires > Date.now() + 60_000) return latest
+      return refreshNous(latest, config.nous?.clientId ?? 'hermes-cli')
+    })
+    if (refreshed?.type !== 'oauth') throw new Error('dsh-auth: Nous credential is missing; run /auth login nous')
+    return refreshed.access
+  }
 
   // Fail closed on store trouble: a credential file that cannot be read
   // must not surface forty models that would all fail at request time.
@@ -193,10 +214,9 @@ export function apply(ctx: Context, config: Config): void {
     // One immutable map for the plugin's lifetime: the snapshot memoizes on
     // identity, and route changes here always mean a plugin remount anyway.
     profiles: () => profiles,
-    // No route ever names an api-key credential, so the override stays
-    // undefined and every request authenticates through the collection's
-    // own auth — the OAuth credential this plugin's store holds.
-    resolveApiKey: async () => undefined,
+    // Explicit API keys cover catalog routes too. OAuth catalog routes still
+    // resolve their grants through pi-ai's injected credential store.
+    resolveApiKey: credentialKey,
     auth: {
       credentials: store,
       authContext: hostAuthContext(),
@@ -219,8 +239,25 @@ export function apply(ctx: Context, config: Config): void {
       return questions === undefined ? undefined : request => questions.ask(request)
     },
     logger: ctx.logger,
+    nousClientId: config.nous?.clientId,
+    credentialChanged: async (provider, credential) => {
+      const entry = custom.get(provider as CustomProviderId)
+      if (entry === undefined) return
+      if (credential === undefined) { entry.clear(); return }
+      entry.clear()
+      const key = credential.type === 'api_key' ? credential.key
+        : credential.type === 'oauth' ? credential.access : undefined
+      if (key === undefined) throw new Error(`dsh-auth: ${provider} credential cannot be used for model discovery`)
+      await entry.refresh(key)
+    },
   })
   service.api = api
+
+  for (const [provider, entry] of custom) {
+    void credentialKey(provider).then(key => key === undefined ? undefined : entry.refresh(key))
+      .then(count => { if (count !== undefined) api.notifyModelsChanged?.(provider) })
+      .catch(error => ctx.logger.warn(`dsh-auth: ${provider} model discovery unavailable: ${error instanceof Error ? error.message : 'request failed'}`))
+  }
 
   ctx.effect(function* () {
     const releases: (() => void)[] = []
@@ -252,7 +289,7 @@ export function apply(ctx: Context, config: Config): void {
       const handler = createAuthCommandHandler(api)
       releases.push(commands.register({
         name: 'auth',
-        description: 'Provider subscription sign-in (OAuth): status, login, logout',
+        description: 'Provider authentication: status, login, logout',
         handler: invocation => {
           const operation = handler(invocation)
           active.add(operation)

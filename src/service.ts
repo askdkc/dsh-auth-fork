@@ -1,6 +1,6 @@
 /**
  * The `ctx.dshAuth` service: the programmatic surface over this plugin's
- * mounted OAuth routes. UIs (the dsh-tui /provider wizard, a web settings
+ * mounted provider routes. UIs (the dsh-tui /provider wizard, a web settings
  * page) enumerate providers with masked sign-in state and drive login/logout
  * without touching the credential file or the pi-ai flow objects; the `/auth`
  * command in `command.ts` is a thin textual veneer over the same api.
@@ -11,10 +11,11 @@
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
-import { asStoredCredential, CredentialFile, type StoredOAuthCredential } from './credentials.js'
-import { oauthOf } from './profiles.js'
+import { asStoredCredential, CredentialFile } from './credentials.js'
+import { canonicalProvider, oauthOf } from './profiles.js'
 import { QuestionBridge, type AskFn } from './interaction.js'
 import type { PiAiProvider } from './pi-ai.js'
+import { loginNous } from './nous-oauth.js'
 
 /**
  * The constructed catalog provider one mounted route carries. 0.1.5 made
@@ -39,8 +40,10 @@ export interface DshAuthSignInStatus {
   oauthLabel: string
   /** The flow's login-call-to-action label, when it ships one. */
   loginLabel: string | undefined
+  authMethods: readonly ('oauth' | 'api-key' | 'device-code' | 'bearer')[]
+  credentialKind: 'oauth-token' | 'api-key' | undefined
   signedIn: boolean
-  expiresAt: number | undefined
+  expiresAt?: number
   /** Signed in, but the stored access token has expired (refresh may still work). */
   expired: boolean
 }
@@ -49,7 +52,10 @@ export interface DshAuthSignInStatus {
 export interface DshAuthLoginResult {
   provider: string
   oauthLabel: string
-  expiresAt: number
+  authMethods: readonly ('oauth' | 'api-key' | 'device-code' | 'bearer')[]
+  credentialKind: 'oauth-token' | 'api-key'
+  expiresAt?: number
+  modelWarning?: string
 }
 
 /** The service api consumed by commands and UIs. */
@@ -57,7 +63,7 @@ export interface DshAuthApi {
   /** Every mounted provider with masked sign-in state. */
   providers(): Promise<readonly DshAuthSignInStatus[]>
   /**
-   * Run one provider's OAuth login. `provider` omitted asks the interactive
+   * Run one provider's login. `provider` omitted asks the interactive
    * surface to choose among providers not currently signed in.
    * @throws Error when no interactive surface is present, the provider is
    *   unknown, a login is already running, or the flow itself fails.
@@ -65,6 +71,10 @@ export interface DshAuthApi {
   login(provider?: string, signal?: AbortSignal): Promise<DshAuthLoginResult>
   /** Remove one provider's stored credential; resolves whether one existed. */
   logout(provider: string): Promise<boolean>
+  /** Register a callback for successful credential mutations. */
+  onCredentialChange?(listener: (provider: string) => void): () => void
+  /** Signal that a previously stored credential's model catalog finished loading. */
+  notifyModelsChanged?(provider: string): void
 }
 
 /** Cordis service holder; `api` is set by the plugin's apply. */
@@ -83,6 +93,8 @@ export interface DshAuthApiDeps {
   /** The interactive ask surface, resolved per call so mounting order never matters. */
   resolveAsk: () => AskFn | undefined
   logger: { warn(message: string): void }
+  nousClientId?: string
+  credentialChanged?: (provider: string, credential: ReturnType<typeof asStoredCredential> | undefined) => Promise<void>
 }
 
 /** Select a provider interactively among `candidates`. */
@@ -114,18 +126,29 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
   const statusOf = async (): Promise<readonly DshAuthSignInStatus[]> => {
     const described = new Map((await deps.store.describe()).map(row => [row.provider, row]))
     return [...deps.profiles.entries()].map(([id, profile]) => {
-      const oauth = oauthOf(mountedProvider(profile))
+      const methods = authMethodsOf(id)
+      const oauth = methods.includes('oauth') ? oauthOf(mountedProvider(profile)) : undefined
       const row = described.get(id)
       return {
         provider: id,
         label: profile.displayName,
-        oauthLabel: oauth.name,
-        loginLabel: oauth.loginLabel,
+        oauthLabel: oauth?.name ?? profile.displayName,
+        loginLabel: oauth?.loginLabel,
+        authMethods: methods,
+        credentialKind: row?.credentialKind,
         signedIn: row !== undefined && !row.expired,
-        expiresAt: row?.expiresAt,
+        ...(row?.expiresAt === undefined ? {} : { expiresAt: row.expiresAt }),
         expired: row?.expired ?? false,
       }
     })
+  }
+
+  const generations = new Map<string, number>()
+  const listeners = new Set<(provider: string) => void>()
+  const changed = (provider: string): void => {
+    for (const listener of listeners) {
+      try { listener(provider) } catch { deps.logger.warn('dsh-auth: a credential-change subscriber failed') }
+    }
   }
 
   const loginOne = async (provider: string, ask: AskFn, signal: AbortSignal | undefined): Promise<DshAuthLoginResult> => {
@@ -133,7 +156,8 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
     if (profile === undefined) {
       throw new Error(`dsh-auth: unknown provider "${provider}" (mounted: ${[...deps.profiles.keys()].join(', ')})`)
     }
-    const oauth = oauthOf(mountedProvider(profile))
+    const methods = authMethodsOf(provider)
+    const generation = generations.get(provider) ?? 0
     const runAbort = new AbortController()
     if (signal !== undefined) {
       if (signal.aborted) runAbort.abort(signal.reason)
@@ -141,14 +165,56 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
     }
     const bridge = new QuestionBridge(ask, runAbort)
     try {
-      const returned = await oauth.login(bridge)
-      const normalized = asStoredCredential(returned)
-      if (normalized === undefined) {
-        throw new Error(`dsh-auth: the ${oauth.name} flow returned an unusable credential; nothing was stored`)
+      let method = methods[0]
+      if (methods.length > 1) {
+        const answer = await ask({
+          questions: [{
+            id: 'dsh-auth-method', header: 'dsh-auth', question: `Sign in to ${profile.displayName} using:`,
+            options: methods.map(item => ({ label: item })),
+          }], signal: runAbort.signal,
+        })
+        method = methods.find(item => item === answer.answers[0]?.selected[0])
+        if (method === undefined) throw new Error('dsh-auth: no authentication method was chosen')
       }
-      const stored: StoredOAuthCredential = normalized
-      await deps.store.modify(provider, async () => stored)
-      return { provider, oauthLabel: oauth.name, expiresAt: stored.expires }
+      if (runAbort.signal.aborted) throw new Error('dsh-auth: sign-in cancelled')
+      let credential: ReturnType<typeof asStoredCredential>
+      if (method === 'oauth') {
+        const oauth = oauthOf(mountedProvider(profile))
+        credential = asStoredCredential(await oauth.login(bridge))
+        if (credential?.type !== 'oauth') throw new Error(`dsh-auth: the ${oauth.name} flow returned an unusable credential`)
+      } else if (method === 'api-key' || method === 'bearer') {
+        const key = await bridge.prompt({ type: 'secret', message: `Enter ${profile.displayName} ${method === 'bearer' ? 'Bearer token' : 'API key'}` })
+        credential = { type: 'api_key', key }
+      } else if (method === 'device-code' && provider === 'nous') {
+        credential = await loginNous(bridge, deps.nousClientId ?? 'hermes-cli')
+      } else {
+        throw new Error('dsh-auth: device-code authentication is unavailable')
+      }
+      if (credential === undefined) throw new Error('dsh-auth: sign-in returned no credential')
+      if (runAbort.signal.aborted || generation !== (generations.get(provider) ?? 0)) {
+        throw new Error('dsh-auth: sign-in cancelled')
+      }
+      const stored = await deps.store.modify(provider, async () =>
+        generation === (generations.get(provider) ?? 0) ? credential : undefined)
+      if (generation !== (generations.get(provider) ?? 0) || stored !== credential) {
+        throw new Error('dsh-auth: sign-in cancelled')
+      }
+      let modelWarning: string | undefined
+      try {
+        await deps.credentialChanged?.(provider, credential)
+      } catch (error: unknown) {
+        modelWarning = error instanceof Error ? error.message : 'model discovery failed'
+      }
+      if (generation !== (generations.get(provider) ?? 0)) {
+        await deps.credentialChanged?.(provider, undefined)
+        throw new Error('dsh-auth: sign-in cancelled')
+      }
+      changed(provider)
+      const expiresAt = credential.type === 'oauth' && provider !== 'openrouter' ? credential.expires : undefined
+      return { provider, oauthLabel: method === 'oauth' ? oauthOf(mountedProvider(profile)).name : profile.displayName, authMethods: methods,
+        credentialKind: credential.type === 'api_key' || provider === 'openrouter' ? 'api-key' : 'oauth-token',
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+        ...(modelWarning === undefined ? {} : { modelWarning }) }
     } finally {
       await bridge.settle()
     }
@@ -158,7 +224,7 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
     providers: statusOf,
     login: async (provider, signal) => {
       const ask = deps.resolveAsk()
-      let target = provider
+      let target = provider === undefined ? undefined : canonicalProvider(provider)
       if (target === undefined) {
         if (ask === undefined) {
           throw new Error('dsh-auth: provider selection needs an interactive surface; name the provider: /auth login <provider>')
@@ -185,12 +251,25 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
       return run
     },
     logout: async provider => {
-      if (!deps.profiles.has(provider)) {
+      const target = canonicalProvider(provider)
+      if (!deps.profiles.has(target)) {
         throw new Error(`dsh-auth: unknown provider "${provider}" (mounted: ${[...deps.profiles.keys()].join(', ')})`)
       }
-      const existed = (await deps.store.read(provider)) !== undefined
-      await deps.store.delete(provider)
+      generations.set(target, (generations.get(target) ?? 0) + 1)
+      const existed = (await deps.store.read(target)) !== undefined
+      await deps.store.delete(target)
+      await deps.credentialChanged?.(target, undefined)
+      if (existed) changed(target)
       return existed
     },
+    onCredentialChange: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
+    notifyModelsChanged: changed,
   }
+}
+
+function authMethodsOf(provider: string): DshAuthSignInStatus['authMethods'] {
+  if (provider === 'openrouter') return ['oauth', 'api-key']
+  if (provider === 'nous') return ['device-code', 'bearer']
+  if (provider === 'opencode' || provider === 'opencode-go' || provider === 'orcarouter' || provider === 'infron') return ['api-key']
+  return ['oauth']
 }

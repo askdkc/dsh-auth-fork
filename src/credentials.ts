@@ -1,26 +1,27 @@
 /**
- * File-backed OAuth credential persistence: a pi-ai `CredentialStore` over
+ * File-backed credential persistence: a pi-ai `CredentialStore` over
  * one JSON document, one credential per provider id.
  *
  * Writes are atomic (temp file + rename) with 0700 directory / 0600 file
  * permissions best-effort on every platform. All mutations go through
  * {@link CredentialFile.modify}, which serializes read-modify-write cycles
- * per provider in-process — pi-ai runs its OAuth refresh *inside* `modify`,
- * so the exclusion here is what keeps concurrent requests from
- * double-refreshing a rotated token. The file is the single source of truth;
+ * across processes — pi-ai runs its OAuth refresh *inside* `modify`, so the
+ * exclusion keeps concurrent requests from double-refreshing a rotated
+ * token. The file is the single source of truth;
  * nothing here ever logs token material, and {@link CredentialFile.describe}
  * reports only non-secret metadata for status surfaces.
  *
  * @module dsh-auth/credentials
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import type { PiAiCredential, PiAiCredentialInfo, PiAiCredentialStore } from './pi-ai.js'
 
-/** The stored credential shape: a pi-ai `OAuthCredential`. */
+/** The stored credential shapes from pi-ai. */
 export type StoredOAuthCredential = Extract<PiAiCredential, { type: 'oauth' }>
+export type StoredApiKeyCredential = Extract<PiAiCredential, { type: 'api_key' }>
 
 /** On-disk document shape. */
 interface CredentialsDocument {
@@ -29,9 +30,14 @@ interface CredentialsDocument {
 }
 
 /** Narrow an unknown parsed value into a stored credential, or reject it. */
-export function asStoredCredential(value: unknown): StoredOAuthCredential | undefined {
+export function asStoredCredential(value: unknown): PiAiCredential | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const record = value as Record<string, unknown>
+  if (record['type'] === 'api_key') {
+    return typeof record['key'] === 'string' && record['key'].length > 0
+      ? value as StoredApiKeyCredential
+      : undefined
+  }
   if (record['type'] !== 'oauth') return undefined
   if (typeof record['access'] !== 'string' || typeof record['refresh'] !== 'string') return undefined
   if (typeof record['expires'] !== 'number' || !Number.isFinite(record['expires'])) return undefined
@@ -56,9 +62,8 @@ const EMPTY_DOCUMENT: CredentialsDocument = { version: 1, providers: {} }
  */
 export class CredentialFile implements PiAiCredentialStore {
   readonly path: string
-  /** Per-provider operation chains: modify/delete never overlap for one id. */
-  private readonly chains = new Map<string, Promise<unknown>>()
-  private cache: CredentialsDocument | undefined
+  /** Serialize all updates in this process; the file lock covers other processes. */
+  private chainTail: Promise<void> = Promise.resolve()
 
   constructor(path: string) {
     this.path = path
@@ -88,13 +93,13 @@ export class CredentialFile implements PiAiCredentialStore {
     providerId: string,
     fn: (current: PiAiCredential | undefined) => Promise<PiAiCredential | undefined>,
   ): Promise<PiAiCredential | undefined> {
-    return this.chain(providerId, async () => {
+    return this.withLock(async () => {
       const document = await this.load()
       const current = document.providers[providerId]
       const replacement = await fn(current)
       if (replacement === undefined || replacement === current) return current
-      if (replacement.type !== 'oauth') {
-        throw new Error(`dsh-auth: refusing to store a "${replacement.type}" credential for "${providerId}" — this store holds OAuth credentials only`)
+      if (asStoredCredential(replacement) === undefined) {
+        throw new Error(`dsh-auth: refusing to store an invalid credential for "${providerId}"`)
       }
       await this.save({ ...document, providers: { ...document.providers, [providerId]: replacement } })
       return replacement
@@ -103,7 +108,7 @@ export class CredentialFile implements PiAiCredentialStore {
 
   /** Remove one provider's credential (logout). */
   async delete(providerId: string): Promise<void> {
-    await this.chain(providerId, async () => {
+    await this.withLock(async () => {
       const document = await this.load()
       if (!(providerId in document.providers)) return
       const providers = { ...document.providers }
@@ -113,34 +118,62 @@ export class CredentialFile implements PiAiCredentialStore {
   }
 
   /** Non-secret metadata for every stored credential, for status surfaces. */
-  async describe(): Promise<readonly { provider: string; expiresAt: number; expired: boolean }[]> {
+  async describe(): Promise<readonly { provider: string; credentialKind: 'oauth-token' | 'api-key'; expiresAt: number | undefined; expired: boolean }[]> {
     const document = await this.load()
     const now = Date.now()
-    return Object.entries(document.providers)
-      .filter((entry): entry is [string, StoredOAuthCredential] => entry[1].type === 'oauth')
-      .map(([provider, credential]) => ({
+    return Object.entries(document.providers).map(([provider, credential]) => {
+      const expiresAt = credential.type === 'oauth' && provider !== 'openrouter'
+        && credential.expires < 8_640_000_000_000_000
+        ? credential.expires
+        : undefined
+      return {
         provider,
-        expiresAt: credential.expires,
-        expired: credential.expires <= now,
-      }))
+        credentialKind: credential.type === 'api_key' || provider === 'openrouter' ? 'api-key' as const : 'oauth-token' as const,
+        expiresAt,
+        expired: expiresAt !== undefined && expiresAt <= now,
+      }
+    })
   }
 
-  /** Run one operation after every earlier operation for the same provider. */
-  private chain<T>(provider: string, operation: () => Promise<T>): Promise<T> {
-    const run = (this.chains.get(provider) ?? Promise.resolve()).then(operation, operation)
-    this.chains.set(provider, run.then(() => undefined, () => undefined))
-    return run
+  /** Hold a process-wide lock through reread, refresh/mutation, and atomic save. */
+  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.chainTail
+    let releaseLocal!: () => void
+    this.chainTail = new Promise<void>(resolve => { releaseLocal = resolve })
+    await previous
+    const lockPath = `${this.path}.lock`
+    const deadline = Date.now() + 120_000
+    try {
+      mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
+      while (true) {
+        try {
+          mkdirSync(lockPath, { mode: 0o700 })
+          break
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') throw error
+          if (Date.now() >= deadline) {
+            throw new Error(`dsh-auth: timed out waiting for credential file lock ${lockPath}`)
+          }
+          await new Promise(resolve => setTimeout(resolve, 100))
+        }
+      }
+      try {
+        return await operation()
+      } finally {
+        rmdirSync(lockPath)
+      }
+    } finally {
+      releaseLocal()
+    }
   }
 
   private async load(): Promise<CredentialsDocument> {
-    if (this.cache !== undefined) return this.cache
     let text: string
     try {
       text = readFileSync(this.path, 'utf8')
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
-        this.cache = EMPTY_DOCUMENT
-        return this.cache
+        return EMPTY_DOCUMENT
       }
       throw new Error(`dsh-auth: cannot read credential file ${this.path}: ${String(error)}`)
     }
@@ -157,10 +190,11 @@ export class CredentialFile implements PiAiCredentialStore {
       throw new Error(`dsh-auth: credential file ${this.path} has an unexpected shape; fix or remove it by hand`)
     }
     const record = parsed as Record<string, unknown>
-    if (record['version'] !== 1 || typeof record['providers'] !== 'object' || record['providers'] === null) {
+    if (record['version'] !== 1 || typeof record['providers'] !== 'object'
+      || record['providers'] === null || Array.isArray(record['providers'])) {
       throw new Error(`dsh-auth: credential file ${this.path} has an unexpected shape; fix or remove it by hand`)
     }
-    const providers: Record<string, PiAiCredential> = {}
+    const providers: Record<string, PiAiCredential> = Object.create(null)
     for (const [provider, value] of Object.entries(record['providers'] as Record<string, unknown>)) {
       const credential = asStoredCredential(value)
       if (credential === undefined) {
@@ -170,8 +204,7 @@ export class CredentialFile implements PiAiCredentialStore {
       }
       providers[provider] = credential
     }
-    this.cache = { version: 1, providers }
-    return this.cache
+    return { version: 1, providers }
   }
 
   private async save(document: CredentialsDocument): Promise<void> {
@@ -185,6 +218,5 @@ export class CredentialFile implements PiAiCredentialStore {
     } catch (error: unknown) {
       throw new Error(`dsh-auth: cannot write credential file ${this.path}: ${String(error)}`)
     }
-    this.cache = document
   }
 }
