@@ -90,6 +90,12 @@ dsh plugin --profile <name> add @askdkc/dsh-auth
 /auth logout anthropic
 ```
 
+`/auth login` には設定済みの全プロバイダーが表示され、ログイン済み・未ログイン・
+トークン期限切れの状態も分かります。ログイン済みのプロバイダーを選ぶと
+再ログインでき、成功時にその認証情報を置き換えます。キャンセルや認証失敗では
+元の認証情報が残ります。`/auth login <provider>` は指定したプロバイダーへ
+直接進みます。
+
 未ログインのプロバイダーにモデルを要求すると、`/auth login <provider>` の案内を添えて
 明示的に失敗します。
 

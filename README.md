@@ -90,6 +90,11 @@ signed-in providers' catalogs (credential-gated — see below).
 /auth logout anthropic
 ```
 
+`/auth login` lists every configured provider and marks it as signed in, not
+signed in, or token expired. Select a signed-in provider to sign in again and
+replace its credential. The existing credential stays in place if you cancel
+or sign-in fails. `/auth login <provider>` goes directly to that provider.
+
 Model requests against a provider you have not signed in to fail loudly with
 the `/auth login <provider>` hint — never silently.
 

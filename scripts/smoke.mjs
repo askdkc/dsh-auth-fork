@@ -20,6 +20,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 const { CredentialFile, buildOAuthProfile, OAUTH_PROVIDER_IDS, canonicalProvider, QuestionBridge, createDshAuthApi, openerFor, CredentialGatedAdapter, apply } =
   await import('../lib/index.js')
 const { createCustomProfile } = await import('../lib/custom-profiles.js')
+const { createAuthCommandHandler } = await import('../lib/command.js')
 const { loginNous, refreshNous } = await import('../lib/nous-oauth.js')
 
 /** Adapter options over one profile — enough for listModels/resolveModel offline. */
@@ -634,6 +635,85 @@ try {
   await keyStore.modify('openrouter', async () => ({ type: 'oauth', access: 'router-key', refresh: '', expires: Number.MAX_SAFE_INTEGER }))
   const routerStatus = (await keyApi.providers()).find(row => row.provider === 'openrouter')
   ok(routerStatus?.credentialKind === 'api-key' && routerStatus.expiresAt === undefined && routerStatus.signedIn, 'OpenRouter OAuth-exchanged key has no displayed expiry')
+
+  console.log('interactive provider selection and re-login')
+  const selectionStore = new CredentialFile(join(root, 'selection', 'credentials.json'))
+  await selectionStore.modify('opencode', async () => ({ type: 'api_key', key: 'old-zen-key' }))
+  const selectionQuestions = []
+  let selectedProvider = 'opencode'
+  let enteredKey = 'new-zen-key'
+  let answerFailure
+  const selectionAsk = async request => {
+    const question = request.questions[0]
+    if (question.id === 'dsh-auth-provider') {
+      selectionQuestions.push(question)
+      if (answerFailure === 'cancel') return { answers: [{ id: question.id, selected: [] }] }
+      const option = question.options.find(row => row.label.includes(`(${selectedProvider})`))
+      if (option === undefined) throw new Error(`missing provider option ${selectedProvider}`)
+      return { answers: [{ id: question.id, selected: [option.label] }] }
+    }
+    if (question.id === 'dsh-auth-secret') {
+      if (answerFailure === 'secret') throw new Error('secret prompt failed')
+      return { answers: [{ id: question.id, selected: [], custom: enteredKey }] }
+    }
+    throw new Error(`unexpected question ${question.id}`)
+  }
+  const selectionApi = createDshAuthApi({
+    // The labels intentionally collide; the picker must map the selected row by provider ID.
+    profiles: new Map([
+      ['opencode', { ...buildOAuthProfile('opencode'), displayName: 'Shared provider name' }],
+      ['opencode-go', { ...buildOAuthProfile('opencode-go'), displayName: 'Shared provider name' }],
+    ]),
+    store: selectionStore, resolveAsk: () => selectionAsk, logger: { warn() {} },
+  })
+  const authCommand = createAuthCommandHandler(selectionApi)
+  const renewed = await authCommand({ rawInput: 'login' })
+  const mixedOptions = selectionQuestions.at(-1).options
+  ok(mixedOptions.length === 2
+    && mixedOptions.some(row => row.label.includes('(opencode)') && row.label.endsWith('— signed in'))
+    && mixedOptions.some(row => row.label.includes('(opencode-go)') && row.label.endsWith('— not signed in')),
+  'provider picker shows signed-in and unsigned mounted providers with readable state')
+  ok(renewed.kind === 'success' && renewed.text.includes('(opencode)')
+    && (await selectionStore.read('opencode'))?.key === 'new-zen-key'
+    && (await selectionStore.read('opencode-go')) === undefined,
+  '/auth login maps a signed-in row to its provider ID and replaces only its stored API key')
+
+  selectedProvider = 'opencode-go'
+  enteredKey = 'go-key'
+  const firstGoLogin = await selectionApi.login()
+  ok(firstGoLogin.provider === 'opencode-go' && (await selectionStore.read('opencode-go'))?.key === 'go-key',
+    'choosing an unsigned provider still signs in through the same credential store')
+
+  selectedProvider = 'opencode'
+  enteredKey = 'latest-zen-key'
+  await selectionApi.login()
+  const signedOptions = selectionQuestions.at(-1).options
+  ok(signedOptions.length === 2 && signedOptions.every(row => row.label.endsWith('— signed in')),
+    'provider picker stays available when every mounted provider is signed in')
+  ok((await selectionStore.read('opencode'))?.key === 'latest-zen-key'
+    && (await selectionStore.read('opencode-go'))?.key === 'go-key',
+    're-login with every provider signed in preserves the unselected credential')
+
+  answerFailure = 'cancel'
+  let cancelledSelection = ''
+  try { await selectionApi.login() } catch (error) { cancelledSelection = error.message }
+  ok(cancelledSelection.includes('no provider was chosen')
+    && (await selectionStore.read('opencode'))?.key === 'latest-zen-key',
+    'cancelling provider selection keeps the existing API key')
+  answerFailure = 'secret'
+  let failedSecret = ''
+  try { await selectionApi.login() } catch (error) { failedSecret = error.message }
+  ok(failedSecret.includes('secret prompt failed')
+    && (await selectionStore.read('opencode'))?.key === 'latest-zen-key'
+    && (await selectionStore.read('opencode-go'))?.key === 'go-key',
+    'failed API-key input leaves both existing credentials intact')
+  answerFailure = undefined
+  enteredKey = 'explicit-zen-key'
+  const questionCount = selectionQuestions.length
+  const explicitRenewal = await authCommand({ rawInput: 'login opencode' })
+  ok(explicitRenewal.kind === 'success' && selectionQuestions.length === questionCount
+    && (await selectionStore.read('opencode'))?.key === 'explicit-zen-key',
+    'explicit /auth login <provider> bypasses the picker and still replaces its credential')
 
   console.log('Nous device OAuth')
   const originalNousFetch = globalThis.fetch

@@ -64,7 +64,7 @@ export interface DshAuthApi {
   providers(): Promise<readonly DshAuthSignInStatus[]>
   /**
    * Run one provider's login. `provider` omitted asks the interactive
-   * surface to choose among providers not currently signed in.
+   * surface to choose among all mounted providers, including signed-in ones.
    * @throws Error when no interactive surface is present, the provider is
    *   unknown, a login is already running, or the flow itself fails.
    */
@@ -99,18 +99,26 @@ export interface DshAuthApiDeps {
 
 /** Select a provider interactively among `candidates`. */
 async function chooseProvider(ask: AskFn, candidates: readonly DshAuthSignInStatus[], signal: AbortSignal | undefined): Promise<string> {
+  const options = candidates.map(row => ({
+    label: `${row.oauthLabel} (${row.provider}) — ${row.signedIn ? 'signed in' : row.expired ? 'token expired' : 'not signed in'}`,
+    description: row.signedIn
+      ? 'Select to replace the credential'
+      : row.expired
+        ? 'Select to sign in again'
+        : row.provider,
+  }))
   const answer = await ask({
     questions: [{
       id: 'dsh-auth-provider',
       header: 'dsh-auth',
       question: 'Sign in with which provider?',
-      options: candidates.map(row => ({ label: row.oauthLabel, description: row.provider })),
+      options,
     }],
     signal,
   })
   const row = answer.answers[0]
   const label = row?.selected[0]
-  const chosen = candidates.find(candidate => candidate.oauthLabel === label)
+  const chosen = candidates[options.findIndex(option => option.label === label)]
   if (chosen === undefined) throw new Error('dsh-auth: no provider was chosen')
   return chosen.provider
 }
@@ -230,9 +238,8 @@ export function createDshAuthApi(deps: DshAuthApiDeps): DshAuthApi {
           throw new Error('dsh-auth: provider selection needs an interactive surface; name the provider: /auth login <provider>')
         }
         const statuses = await statusOf()
-        const candidates = statuses.filter(row => !row.signedIn)
-        if (candidates.length === 0) throw new Error('dsh-auth: every mounted provider is already signed in')
-        target = await chooseProvider(ask, candidates, signal)
+        if (statuses.length === 0) throw new Error('dsh-auth: no providers are mounted')
+        target = await chooseProvider(ask, statuses, signal)
       } else if (!deps.profiles.has(target)) {
         throw new Error(`dsh-auth: unknown provider "${target}" (mounted: ${[...deps.profiles.keys()].join(', ')})`)
       }
