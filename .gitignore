@@ -1,3 +1,5 @@
+AGENTS.md
 node_modules/
 lib/
 *.tsbuildinfo
+.kiokuko.json
