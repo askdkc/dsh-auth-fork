@@ -10,6 +10,7 @@
  * @module dsh-auth/profiles
  */
 
+import { randomUUID } from 'node:crypto'
 import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import { adapterBuiltinProviders, type PiAiProvider } from './pi-ai.js'
@@ -62,6 +63,24 @@ function catalogProviderOf(id: string): PiAiProvider {
     )
   }
   return found
+}
+
+/** Add the per-request routing header that the installed pi-ai catalog omits. */
+function withOpenCodeSessionHeader(catalog: PiAiProvider): PiAiProvider {
+  return {
+    ...catalog,
+    streamSimple(model, context, options) {
+      return catalog.streamSimple(model, context, {
+        ...options,
+        headers: {
+          ...options?.headers,
+          // Agent turns keep their durable id; direct calls without one still
+          // need a distinct routing identity instead of a gateway 400.
+          'x-opencode-session': options?.sessionId || randomUUID(),
+        },
+      })
+    },
+  }
 }
 
 /** The OAuth flow object for one mounted route (login/refresh/toAuth live here). */
@@ -123,7 +142,11 @@ export function buildOAuthProfile(
   if (!(CATALOG_PROVIDER_IDS as readonly string[]).includes(id)) {
     throw new Error(`dsh-auth: "${id}" is not a catalog provider this build mounts (${CATALOG_PROVIDER_IDS.join(', ')})`)
   }
-  const catalog = withModelOverrides(catalogProviderOf(id), modelOverrides)
+  const provider = catalogProviderOf(id)
+  const catalog = withModelOverrides(
+    id === 'opencode' || id === 'opencode-go' ? withOpenCodeSessionHeader(provider) : provider,
+    modelOverrides,
+  )
   return {
     provider: id,
     displayName: catalog.name,

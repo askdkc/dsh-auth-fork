@@ -229,7 +229,8 @@ try {
     ]) {
       let request
       globalThis.fetch = async (url, options) => {
-        request = { url: String(url), authorization: new Headers(options.headers).get('authorization'), body: JSON.parse(options.body) }
+        const headers = new Headers(options.headers)
+        request = { url: String(url), authorization: headers.get('authorization'), session: headers.get('x-opencode-session'), body: JSON.parse(options.body) }
         return new Response([
           'data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
           'data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
@@ -243,11 +244,52 @@ try {
       }, async () => true)
       const chunks = []
       for await (const chunk of adapter.stream({ provider: id, model: modelId,
+        sessionId: 'dsh-session-123',
         messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools: [],
       })) chunks.push(chunk)
       ok(request?.url === expectedUrl && request.authorization === 'Bearer catalog-fixture-key'
+        && request.session === (id.startsWith('opencode') ? 'dsh-session-123' : null)
         && request.body.model === modelId && chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'ok'),
       `${id} catalog model streams to the exact Chat Completions URL with its API key`)
+    }
+
+    for (const id of ['opencode', 'opencode-go']) {
+      const route = buildOAuthProfile(id)
+      const adapter = new CredentialGatedAdapter({
+        ...gateAdapterOptions(), profiles: () => new Map([[id, route]]),
+        resolveApiKey: async () => 'catalog-fixture-key',
+      }, async () => true)
+      const otherApis = id === 'opencode'
+        ? ['anthropic-messages', 'openai-responses', 'google-generative-ai']
+        : ['anthropic-messages', 'openai-responses']
+      for (const api of otherApis) {
+        let session
+        globalThis.fetch = async (_url, options) => {
+          session = new Headers(options.headers).get('x-opencode-session')
+          return new Response('fixture rejection', { status: 418 })
+        }
+        const model = route.piProvider.getModels().find(model => model.api === api)
+        try {
+          for await (const _chunk of adapter.stream({ provider: id, model: model.id,
+            sessionId: 'dsh-session-123', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools: [],
+          })) { /* A rejected fixture only needs to reach the HTTP boundary. */ }
+        } catch { /* Expected fixture rejection. */ }
+        ok(session === 'dsh-session-123', `${id} ${api} sends the stable session header`)
+      }
+      const fallbackSessions = []
+      globalThis.fetch = async (_url, options) => {
+        fallbackSessions.push(new Headers(options.headers).get('x-opencode-session'))
+        return new Response('fixture rejection', { status: 418 })
+      }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          for await (const _chunk of adapter.stream({ provider: id, model: 'deepseek-v4-flash',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools: [],
+          })) { /* A rejected fixture only needs to reach the HTTP boundary. */ }
+        } catch { /* Expected fixture rejection. */ }
+      }
+      ok(fallbackSessions.length === 2 && fallbackSessions.every(Boolean) && fallbackSessions[0] !== fallbackSessions[1],
+        `${id} direct calls without a session id receive distinct routing headers`)
     }
   } finally { globalThis.fetch = catalogFetch }
 
