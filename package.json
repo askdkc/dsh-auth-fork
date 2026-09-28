@@ -1,6 +1,6 @@
 {
   "name": "@askdkc/dsh-auth",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Provider authentication and model routes for DeepSeek Harness — no dsh source patch, bundled with dsh-tui",
   "license": "MIT",
   "repository": {
